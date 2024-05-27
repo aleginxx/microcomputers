@@ -1,0 +1,362 @@
+#define F_CPU 16000000UL
+#include<avr/io.h>
+#include<avr/interrupt.h>
+#include<util/delay.h>
+
+#define PCA9555_0_ADDRESS 0x40 // A0=A1=A2=0 by hardware
+#define TWI_READ 1             // Reading from TWI device
+#define TWI_WRITE 0            // Writing to TWI device
+#define SCL_CLOCK 100000L       // TWI clock in Hz
+
+// Fscl = Fcpu / (16 + 2 * TWBR0_VALUE * PRESCALER_VALUE)
+#define TWBR0_VALUE ((F_CPU / SCL_CLOCK) - 16) / 2
+
+// PCA9555 REGISTERS
+typedef enum {
+    REG_INPUT_0 = 0,
+    REG_INPUT_1 = 1,
+    REG_OUTPUT_0 = 2,
+    REG_OUTPUT_1 = 3,
+    REG_POLARITY_INV_0 = 4,
+    REG_POLARITY_INV_1 = 5,
+    REG_CONFIGURATION_0 = 6,
+    REG_CONFIGURATION_1 = 7
+} PCA9555_REGISTERS;
+
+// ----------- Master Transmitter/Receiver -------------------
+#define TW_START 0x08
+#define TW_REP_START 0x10
+
+// ---------------- Master Transmitter ----------------------
+#define TW_MT_SLA_ACK 0x18
+#define TW_MT_SLA_NACK 0x20
+#define TW_MT_DATA_ACK 0x28
+
+// ---------------- Master Receiver ----------------
+#define TW_MR_SLA_ACK 0x40
+#define TW_MR_SLA_NACK 0x48
+#define TW_MR_DATA_NACK 0x58
+
+#define TW_STATUS_MASK 0b11111000
+#define TW_STATUS (TWSR0 & TW_STATUS_MASK)
+
+// Initialize TWI clock
+void twi_init(void)
+{
+    TWSR0 = 0;            // PRESCALER_VALUE = 1
+    TWBR0 = TWBR0_VALUE;  // SCL_CLOCK 100KHz
+}
+
+// Read one byte from the TWI device (request more data from device)
+unsigned char twi_readAck(void)
+{
+    TWCR0 = (1 << TWINT) | (1 << TWEN) | (1 << TWEA);
+    while (!(TWCR0 & (1 << TWINT)));
+    return TWDR0;
+}
+
+// Read one byte from the TWI device, read is followed by a stop condition
+unsigned char twi_readNak(void)
+{
+    TWCR0 = (1 << TWINT) | (1 << TWEN);
+    while (!(TWCR0 & (1 << TWINT)));
+    return TWDR0;
+}
+
+// Issues a start condition and sends address and transfer direction.
+// Return 0 = device accessible, 1 = failed to access device
+unsigned char twi_start(unsigned char address)
+{
+    uint8_t twi_status;
+    // Send START condition
+    TWCR0 = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+    // Wait until transmission completed
+    while (!(TWCR0 & (1 << TWINT)));
+    // Check value of TWI Status Register.
+    twi_status = TW_STATUS & 0xF8;
+    if ((twi_status != TW_START) && (twi_status != TW_REP_START))
+        return 1;
+    // Send device address
+    TWDR0 = address;
+    TWCR0 = (1 << TWINT) | (1 << TWEN);
+    // Wait until transmission completed and ACK/NACK has been received
+    while (!(TWCR0 & (1 << TWINT)));
+    // Check value of TWI Status Register.
+    twi_status = TW_STATUS & 0xF8;
+    if ((twi_status != TW_MT_SLA_ACK) && (twi_status != TW_MR_SLA_ACK))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+// Send start condition, address, transfer direction.
+// Use ack polling to wait until device is ready
+void twi_start_wait(unsigned char address)
+{
+    uint8_t twi_status;
+    while (1)
+    {
+        // Send START condition
+        TWCR0 = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+        // Wait until transmission completed
+        while (!(TWCR0 & (1 << TWINT)));
+        // Check value of TWI Status Register.
+        twi_status = TW_STATUS & 0xF8;
+        if ((twi_status != TW_START) && (twi_status != TW_REP_START))
+            continue;
+        // Send device address
+        TWDR0 = address;
+        TWCR0 = (1 << TWINT) | (1 << TWEN);
+        // Wait until transmission completed
+        while (!(TWCR0 & (1 << TWINT)));
+        // Check value of TWI Status Register.
+        twi_status = TW_STATUS & 0xF8;
+        if ((twi_status == TW_MT_SLA_NACK) || (twi_status == TW_MR_DATA_NACK))
+        {
+            /* Device busy, send stop condition to terminate write operation */
+            TWCR0 = (1 << TWINT) | (1 << TWEN) | (1 << TWSTO);
+            // Wait until stop condition is executed and bus released
+            while (TWCR0 & (1 << TWSTO));
+            continue;
+        }
+        break;
+    }
+}
+
+// Send one byte to TWI device, Return 0 if write successful or 1 if write failed
+unsigned char twi_write(unsigned char data)
+{
+    // Send data to the previously addressed device
+    TWDR0 = data;
+
+    TWCR0 = (1 << TWINT) | (1 << TWEN);
+    // Wait until transmission completed
+    while (!(TWCR0 & (1 << TWINT)));
+    if ((TW_STATUS & 0xF8) != TW_MT_DATA_ACK)
+        return 1;
+    return 0;
+}
+
+// Send repeated start condition, address, transfer direction
+// Return: 0 device accessible
+// 1 failed to access device
+unsigned char twi_rep_start(unsigned char address)
+{
+    return twi_start(address);
+}
+
+// Terminates the data transfer and releases the TWI bus
+void twi_stop(void)
+{
+    // Send stop condition
+    TWCR0 = (1 << TWINT) | (1 << TWEN) | (1 << TWSTO);
+    // Wait until stop condition is executed and bus released
+    while (TWCR0 & (1 << TWSTO));
+}
+
+void PCA9555_0_write(PCA9555_REGISTERS reg, uint8_t value)
+{
+    twi_start_wait(PCA9555_0_ADDRESS + TWI_WRITE);
+    twi_write(reg);
+    twi_write(value);
+    twi_stop();
+}
+
+uint8_t PCA9555_0_read(PCA9555_REGISTERS reg)
+{
+    uint8_t ret_val;
+    twi_start_wait(PCA9555_0_ADDRESS + TWI_WRITE);
+    twi_write(reg);
+    twi_rep_start(PCA9555_0_ADDRESS + TWI_READ);
+    ret_val = twi_readNak();
+    twi_stop();
+    return ret_val;
+}
+
+// Define an array to store memory and current key states
+unsigned char memory[2];
+unsigned char currentKeyState[2];
+unsigned char currentKey;
+
+// Function to scan a specific row of the keypad
+unsigned char scan_row(int rowIndex) {
+    // Create a mask to select the desired row
+    unsigned char mask = 0b00000001;
+    rowIndex = rowIndex - 1;
+    mask = (mask << rowIndex);
+    mask = ~mask;
+
+    // Set the selected row to logic 0 (inverted logic) using I2C communication
+    PCA9555_0_write(REG_OUTPUT_1, mask);
+    
+    // Read the input state to check if a column is tapped on the selected row
+    uint8_t inputState = PCA9555_0_read(REG_INPUT_1);
+    
+    // Keep 4 MSB, which represent the column state, and invert the logic
+    return ~(inputState | 0x0F);
+}
+
+// Function to swap the low-order with high-order bits
+unsigned char swapNibbles(unsigned char x) {
+    return ((x & 0x0F) << 4 | (x & 0xF0) >> 4);
+}
+
+// Function to scan the entire keypad and update the currentKeyState array
+void scan_keypad() {
+    unsigned char keyState;
+
+    // Scan each row of the keypad
+    keyState = scan_row(1);
+    currentKeyState[0] = swapNibbles(keyState);
+
+    keyState = scan_row(2);
+    currentKeyState[0] += keyState;
+
+    keyState = scan_row(3);
+    currentKeyState[1] = swapNibbles(keyState);
+
+    keyState = scan_row(4);
+    currentKeyState[1] += keyState;
+}
+
+// Function to check if there is a falling edge in the keypad state
+int scan_keypad_falling_edge() {
+    scan_keypad();
+    // Check if both key state arrays are 0, indicating no keys are pressed
+    if ((currentKeyState[0] == 0b00000000) && (currentKeyState[1] == 0b00000000)) return 0;
+    else return 1;
+}
+
+// Function to check if there is a rising edge in the keypad state
+int scan_keypad_rising_edge() {
+    scan_keypad();
+
+    unsigned char tempKeyState[2];
+    tempKeyState[0] = currentKeyState[0];
+    tempKeyState[1] = currentKeyState[1];
+
+    // Wait for a short delay
+    _delay_ms(10);
+
+    scan_keypad();
+
+    // Compare the states before and after the delay
+    currentKeyState[0] &= tempKeyState[0];
+    currentKeyState[1] &= tempKeyState[1];
+
+    tempKeyState[0] = memory[0];
+    tempKeyState[1] = memory[1];
+
+    memory[0] = currentKeyState[0];
+    memory[1] = currentKeyState[1];
+
+    currentKeyState[0] &= ~tempKeyState[0];
+    currentKeyState[1] &= ~tempKeyState[1];
+
+    // Return true if any key is pressed
+    return (currentKeyState[0] || currentKeyState[1]);
+}
+
+// Function to convert the current key state to ASCII representation
+unsigned char keypad_to_ascii() {
+    // Check each bit of the key states and return the corresponding ASCII character
+    if (currentKeyState[0] & 0x01)
+        return '*';
+
+    if (currentKeyState[0] & 0x02)
+        return '0';
+
+    if (currentKeyState[0] & 0x04)
+        return '#';
+
+    if (currentKeyState[0] & 0x08)
+        return 'D';
+
+    if (currentKeyState[0] & 0x10)
+        return '7';
+
+    if (currentKeyState[0] & 0x20)
+        return '8';
+
+    if (currentKeyState[0] & 0x40)
+        return '9';
+
+    if (currentKeyState[0] & 0x80)
+        return 'C';
+
+    if (currentKeyState[1] & 0x01)
+        return '4';
+
+    if (currentKeyState[1] & 0x02)
+        return '5';
+
+    if (currentKeyState[1] & 0x04)
+        return '6';
+
+    if (currentKeyState[1] & 0x08)
+        return 'B';
+
+    if (currentKeyState[1] & 0x10)
+        return '1';
+
+    if (currentKeyState[1] & 0x20)
+        return '2';
+
+    if (currentKeyState[1] & 0x40)
+        return '3';
+
+    if (currentKeyState[1] & 0x80)
+        return 'A';
+
+    return 0; // error
+}
+
+// Function to control LEDs based on the pressed key
+void controlLEDs(char key) {
+    // Check which key is pressed and light up the corresponding LED
+    switch (key) {
+    case '1':
+        PORTB = 0b00000001;
+        break;
+    case '5':
+        PORTB = 0b00000010;
+        break;
+    case '9':
+        PORTB = 0b00000100;
+        break;
+    case 'D':
+        PORTB = 0b00001000;
+        break;
+    default:
+        break;
+    }
+}
+
+// Main function
+int main() {
+    // Initialize I2C communication and set up LED configuration
+    twi_init();
+    DDRB = 0xFF;
+    PCA9555_0_write(REG_CONFIGURATION_0, 0x00);
+    PCA9555_0_write(REG_CONFIGURATION_1, 0xF0);
+
+    memory[0] = 0;
+    memory[1] = 0;
+
+    // Main loop
+    while (1) {
+        // Check for a falling edge in the keypad state
+        while (scan_keypad_falling_edge() == 1) {
+            // Get the ASCII representation of the pressed key
+            char pressedKey = keypad_to_ascii();
+            // Control LEDs based on the pressed key
+            controlLEDs(pressedKey);
+        }
+
+        // Turn off all LEDs when no key is pressed
+        PORTB = 0b00000000;
+    }
+
+    return 0;
+}
